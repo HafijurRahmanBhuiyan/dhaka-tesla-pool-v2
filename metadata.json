@@ -1,0 +1,6 @@
+{
+  "name": "Dhaka Tesla Pool Architecture & Specification",
+  "description": "System architecture, ERD, database design, and interactive ride-pooling simulator for Dhaka Tesla Pool MVP.",
+  "requestFramePermissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
