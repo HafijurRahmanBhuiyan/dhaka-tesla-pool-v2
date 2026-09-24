@@ -729,120 +729,127 @@ CREATE INDEX idx_ratings_ratee ON ratings(ratee_user_id);
 
 export const DOCKER_COMPOSE_YML = `# =========================================================================
 # DHAKA TESLA POOL MVP - DOCKER COMPOSE SPECIFICATION
-# Services: PostgreSQL 16, Redis 7, Node.js API (Fastify/Express), Vite React Web
+# Services: db (PostgreSQL 16), api (Node.js/Express :4000), web (React/Vite :5173)
+# Single command launch: docker compose up --build
 # =========================================================================
 
-version: '3.9'
+version: '3.8'
 
 services:
   # -----------------------------------------------------------------------
-  # 1. PostgreSQL Database with Persistent Storage
+  # 1. Database Service (PostgreSQL 16) with Named Volume & Healthcheck
   # -----------------------------------------------------------------------
-  postgres:
+  db:
     image: postgres:16-alpine
-    container_name: dhaka_tesla_postgres
+    container_name: dhaka_pool_db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: \${POSTGRES_USER:-dhaka_pool_user}
-      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-tesla_secret_pass_2026}
-      POSTGRES_DB: \${POSTGRES_DB:-dhaka_tesla_pool_db}
+      POSTGRES_USER: \${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-postgres_dev_password}
+      POSTGRES_DB: \${POSTGRES_DB:-dhaka_tesla_pool}
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER:-dhaka_pool_user} -d \${POSTGRES_DB:-dhaka_tesla_pool_db}"]
+      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER:-postgres} -d \${POSTGRES_DB:-dhaka_tesla_pool}"]
       interval: 5s
       timeout: 5s
       retries: 5
+      start_period: 5s
     networks:
-      - tesla_net
+      - app_network
 
   # -----------------------------------------------------------------------
-  # 2. Redis In-Memory Cache, Pub/Sub & Geospatial Broker
-  # -----------------------------------------------------------------------
-  redis:
-    image: redis:7-alpine
-    container_name: dhaka_tesla_redis
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "\${REDIS_PASSWORD:-redis_tesla_secret}"]
-    ports:
-      - "6379:6379"
-    volumes:
-      - redisdata:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "\${REDIS_PASSWORD:-redis_tesla_secret}", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    networks:
-      - tesla_net
-
-  # -----------------------------------------------------------------------
-  # 3. Node.js Backend API Service (Express or Fastify)
+  # 2. Backend API Service (Node.js / Express, Port 4000) with /health check
   # -----------------------------------------------------------------------
   api:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: dhaka_tesla_api
+    container_name: dhaka_pool_api
     restart: unless-stopped
-    environment:
-      NODE_ENV: development
-      PORT: 4000
-      DATABASE_URL: postgres://\${POSTGRES_USER:-dhaka_pool_user}:\${POSTGRES_PASSWORD:-tesla_secret_pass_2026}@postgres:5432/\${POSTGRES_DB:-dhaka_tesla_pool_db}
-      REDIS_URL: redis://:\${REDIS_PASSWORD:-redis_tesla_secret}@redis:6379
-      JWT_SECRET: \${JWT_SECRET:-dhaka_tesla_jwt_super_secret_32chars_min}
-      MAX_DETOUR_FACTOR: 1.30
-      DEFAULT_TESLA_CAPACITY: 4
-      BASE_FARE_BDT: 150.00
-      PER_KM_RATE_BDT: 45.00
-      POOL_DISCOUNT_PCT: 30.00
     ports:
       - "4000:4000"
+    environment:
+      NODE_ENV: development
+      PORT: \${PORT:-4000}
+      DATABASE_URL: \${DATABASE_URL:-postgres://postgres:postgres_dev_password@db:5432/dhaka_tesla_pool}
+      JWT_SECRET: \${JWT_SECRET:-dev_jwt_secret_change_in_production_32chars}
     depends_on:
-      postgres:
+      db:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:4000/health || curl -f http://localhost:4000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     volumes:
       - ./backend:/app
       - /app/node_modules
     networks:
-      - tesla_net
+      - app_network
 
   # -----------------------------------------------------------------------
-  # 4. React Vite SPA Frontend
+  # 3. Frontend Web Service (React / Vite Dev Server, Port 5173)
   # -----------------------------------------------------------------------
   web:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: dhaka_tesla_web
+    container_name: dhaka_pool_web
     restart: unless-stopped
+    ports:
+      - "5173:5173"
     environment:
       VITE_API_URL: http://localhost:4000
-      VITE_WS_URL: ws://localhost:4000
-    ports:
-      - "3000:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     volumes:
       - ./frontend:/app
       - /app/node_modules
     networks:
-      - tesla_net
+      - app_network
 
+# -------------------------------------------------------------------------
+# Persistent Named Volumes
+# -------------------------------------------------------------------------
 volumes:
-  pgdata:
-    driver: local
-  redisdata:
+  postgres_data:
     driver: local
 
+# -------------------------------------------------------------------------
+# Bridge Network
+# -------------------------------------------------------------------------
 networks:
-  tesla_net:
+  app_network:
     driver: bridge
+`;
+
+export const ENV_EXAMPLE = `# =============================================================================
+# ENVIRONMENT CONFIGURATION EXAMPLE (.env.example)
+# Copy this file to .env before starting the Docker Compose cluster:
+#   cp .env.example .env
+# =============================================================================
+
+# Server Port (Node.js API)
+PORT=4000
+
+# PostgreSQL Connection String (uses 'db' service name within Docker network)
+DATABASE_URL=postgres://postgres:postgres_dev_password@db:5432/dhaka_tesla_pool
+
+# JWT Secret for Session & Token Authentication (min 32 characters for production)
+JWT_SECRET=your_jwt_secret_min_32_characters_here
+
+# PostgreSQL Database Service Credentials (used by 'db' service)
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres_dev_password
+POSTGRES_DB=dhaka_tesla_pool
+
+# Frontend Vite Client Configuration
+VITE_API_URL=http://localhost:4000
 `;
 
 export const CONCURRENCY_SQL_SNIPPET = `-- =========================================================================
