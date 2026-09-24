@@ -57,18 +57,23 @@ graph TB
         PostgresInstance[("PostgreSQL 16 + PostGIS<br/>• Spatial Indexes (GIST on GPS Coordinates)<br/>• B-Tree Indexes on Foreign Keys & Status Filters<br/>• Check Constraints (Seat Bounds 1-4, Ratings 1-5)<br/>• Immutable Audit Ledger (ride_status_history)")]
     end
 
-    ClientLayer -->|HTTPS REST API / WSS| NginxGateway
-    NginxGateway -->|Reverse Proxy HTTP :3000| HttpControllers
-    NginxGateway -->|WebSocket Upgrade :3000| SocketServer
+    PassengerApp -->|HTTPS REST API / WSS| NginxGateway
+    DriverApp -->|HTTPS REST API / WSS| NginxGateway
+    AdminDashboard -->|HTTPS REST API| NginxGateway
+    NginxGateway -->|Reverse Proxy HTTP 3000| HttpControllers
+    NginxGateway -->|WebSocket Upgrade 3000| SocketServer
     HttpControllers --> AuthMw
     AuthMw --> CoreDomain
-    SocketServer <--> RedisClient
+    SocketServer -->|PubSub Event Stream| RedisClient
+    RedisClient -->|Location Broadcast| SocketServer
     PoolMatcher --> RedisClient
     PoolMatcher --> DBAccess
     Dispatcher --> DBAccess
     FareEngine --> DBAccess
-    RedisClient <--> RedisInstance
-    DBAccess <-->|Connection Pool (pg.Pool)| PostgresInstance
+    RedisClient --> RedisInstance
+    RedisInstance --> RedisClient
+    DBAccess -->|Connection Pool via pg.Pool| PostgresInstance
+    PostgresInstance -->|Query Result Set| DBAccess
 ```
 
 ### Component Roles & Responsibilities
@@ -257,42 +262,127 @@ erDiagram
 
 ---
 
-## 5. Concurrency Control & Overbooking Prevention
+## 5. Concurrency Control, Ride Lifecycle State Machine & Matching Rule
 
-To guarantee that a 4-seat Tesla Model 3 never accepts more passengers than physical cabin seats allow, the reservation engine executes atomic row-level locks in PostgreSQL:
+### 5.1 Explicit Ride Lifecycle State Machine
+The system strictly enforces the ride request lifecycle through an immutable state machine rather than arbitrary free-text updates. Any transition not explicitly listed in the transition table below is immediately rejected with `400 Bad Request` and an `INVALID_STATE_TRANSITION` error code:
+
+| Current Status | Allowed Target Statuses | Rejection Behavior |
+| :--- | :--- | :--- |
+| **`REQUESTED`** | `MATCHED`, `ACCEPTED`, `CANCELLED` | Rejects `DRIVER_ARRIVED`, `STARTED`, `COMPLETED` |
+| **`MATCHED`** | `ACCEPTED`, `DRIVER_ARRIVED`, `CANCELLED` | Rejects `REQUESTED`, `STARTED`, `COMPLETED` |
+| **`ACCEPTED`** | `DRIVER_ARRIVED`, `CANCELLED` | Rejects `REQUESTED`, `MATCHED`, `COMPLETED` |
+| **`DRIVER_ARRIVED`** | `STARTED`, `CANCELLED` | Rejects `REQUESTED`, `MATCHED`, `ACCEPTED` |
+| **`STARTED`** | `COMPLETED`, `CANCELLED` | Rejects `REQUESTED`, `MATCHED`, `DRIVER_ARRIVED` |
+| **`COMPLETED`** | *None (Terminal State)* | Rejects any subsequent transition |
+| **`CANCELLED`** | *None (Terminal State)* | Rejects any subsequent transition; frees pool seats |
+
+Every state transition writes an immutable audit record to `ride_status_history` storing `(old_status, new_status, actor_id, actor_role, timestamp, reason)`.
+
+### 5.2 Corridor Pool Matching Function & Compatibility Rule
+Given a new ride request $R$ and a candidate pool $P$ with assigned vehicle $V$:
+
+1. **Strict Seat Availability:**  
+   $$\text{requested\_seats} \le P.\text{available\_seats} \quad \text{AND} \quad \sum \text{reserved\_seats} + \text{requested\_seats} \le V.\text{seat\_capacity}$$
+2. **Lifecycle State:**  
+   Pool $P$ must be in `FORMING` or `MATCHED` state (pools in `DISPATCHED`, `IN_PROGRESS`, or `COMPLETED` cannot accept new riders).
+3. **Pickup Cluster Proximity:**  
+   $R$'s pickup zone must belong to the same arterial geographic cluster (e.g., North Dhaka: Gulshan, Banani, Uttara) or lie within a maximum detour threshold ($\le 1.5\text{ km}$) of existing corridor waypoints.
+4. **Directional Vector Alignment:**  
+   The bearing vector from pickup to dropoff $(\vec{d}_{R})$ must match the pool's route direction ($\vec{d}_{P}$) within an angular tolerance of $\pm 45^\circ$ (e.g., both Southbound along the Dhaka-Mymensingh / Pragati Sarani corridor).
+5. **Maximum Detour Factor:**  
+   Inserting the new pickup and dropoff must not increase total pool journey distance by more than 30% ($\text{Detour Factor} \le 1.30\times$).
+
+### 5.3 Database Transaction with Row-Level Locking (`SELECT ... FOR UPDATE`)
+To guarantee that two passengers attempting to book the last available seat on a 4-seat Tesla Model 3 cannot both succeed simultaneously, the allocation executes inside an ACID database transaction using PostgreSQL row-level exclusive locks:
 
 ```sql
 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
 
--- 1. Exclusively lock the pool record
-SELECT id, available_seats, max_seats, status 
+-- 1. Exclusively lock the candidate pool row (blocks concurrent transactions on this pool)
+SELECT id, vehicle_id, available_seats, seat_capacity, status 
 FROM pools 
-WHERE id = :pool_id AND status = 'FORMING' 
+WHERE id = :pool_id AND status IN ('FORMING', 'MATCHED')
 FOR UPDATE;
 
--- 2. Validate invariant in application logic:
--- IF available_seats < requested_seats THEN ROLLBACK / REJECT;
+-- 2. Lock vehicle record to enforce strict physical cabin seat ceiling
+SELECT id, total_seat_capacity
+FROM vehicles
+WHERE id = :vehicle_id
+FOR SHARE;
 
--- 3. Insert pool membership
+-- 3. Calculate verified current reserved seats under active memberships
+SELECT COALESCE(SUM(seats_reserved), 0) AS current_booked_seats
+FROM pool_members
+WHERE pool_id = :pool_id AND member_status != 'CANCELLED';
+
+-- 4. Invariant Assertion (Executed under exclusive row lock):
+-- IF (current_booked_seats + :requested_seats > :total_seat_capacity) OR (:requested_seats > :available_seats) THEN
+--    ROLLBACK;
+--    RAISE EXCEPTION 'SEAT_CAPACITY_EXCEEDED';
+
+-- 5. Insert verified pool member
 INSERT INTO pool_members (
-    pool_id, ride_request_id, passenger_id, seats_reserved, pickup_order, dropoff_order
+    id, pool_id, ride_request_id, passenger_id, seats_reserved,
+    pickup_zone, dropoff_zone, pickup_order, dropoff_order, member_status, joined_at
 ) VALUES (
-    :pool_id, :request_id, :passenger_id, :requested_seats, :p_seq, :d_seq
+    gen_random_uuid(), :pool_id, :request_id, :passenger_id, :requested_seats,
+    :pickup_zone, :dropoff_zone, :pickup_order, :dropoff_order, 'BOOKED', NOW()
 );
 
--- 4. Atomically decrement seats remaining
+-- 6. Atomically decrement remaining pool seats
 UPDATE pools 
 SET available_seats = available_seats - :requested_seats,
-    status = CASE WHEN available_seats - :requested_seats = 0 THEN 'DISPATCHED' ELSE 'FORMING' END
+    status = CASE WHEN available_seats - :requested_seats = 0 THEN 'MATCHED' ELSE status END,
+    updated_at = NOW()
 WHERE id = :pool_id;
 
--- 5. Mark ride request as matched
+-- 7. Advance ride request status via State Machine
 UPDATE ride_requests 
-SET status = 'MATCHED', pool_id = :pool_id 
+SET status = 'MATCHED', pool_id = :pool_id, updated_at = NOW()
 WHERE id = :request_id;
+
+-- 8. Write immutable audit log
+INSERT INTO ride_status_history (
+    id, ride_request_id, pool_id, old_status, new_status, changed_by_user_id, reason_or_notes, created_at
+) VALUES (
+    gen_random_uuid(), :request_id, :pool_id, 'REQUESTED', 'MATCHED', :actor_id, 'Matched with exclusive row lock', NOW()
+);
 
 COMMIT;
 ```
+
+If two concurrent requests attempt to reserve the final seat, the first transaction acquires the `FOR UPDATE` lock. The second transaction blocks until the first commits. When unblocked, the second transaction evaluates `available_seats = 0` and is safely rolled back with `409 Conflict: SEAT_CAPACITY_EXCEEDED`, completely eliminating double-booking race conditions.
+
+### 5.4 Pure Fare Calculation Engine (Integer Paisa Arithmetic)
+
+To eliminate floating-point precision loss and rounding divergence across client/server boundaries, all monetary values in Dhaka Tesla Pool are represented and calculated strictly as **integers in paisa** ($1\text{ BDT} = 100\text{ paisa}$).
+
+#### Formula:
+$$\text{distanceCharge} = \text{round}(\text{distanceKm} \times \text{ratePerKm})$$
+$$\text{grossFare} = \text{baseFare} + \text{distanceCharge}$$
+$$\text{poolDiscount} = \text{round}\left(\text{grossFare} \times \frac{\text{poolDiscountPercent}}{100}\right)$$
+$$\text{passengerFare} = \text{grossFare} - \text{poolDiscount}$$
+
+#### Worked Example: Nusrat & Rafiq Overlapping Trip (2+ Shared Riders)
+- **Base Fare:** $3{,}000\text{ paisa}$ ($30.00\text{ BDT}$)
+- **Rate per Km:** $2{,}500\text{ paisa/km}$ ($25.00\text{ BDT/km}$)
+- **Pool Discount:** $20\%$ ($\text{poolDiscountPercent} = 20$) applied when $2+$ riders share an overlapping corridor pool.
+
+| Metric | Rider 1: Nusrat | Rider 2: Rafiq |
+| :--- | :--- | :--- |
+| **Pickup $\to$ Dropoff** | Gulshan-2 $\to$ Motijheel | Banani 11 $\to$ Motijheel |
+| **Trip Distance** | $10.0\text{ km}$ | $8.5\text{ km}$ |
+| **Base Fare** | $3{,}000\text{ paisa}$ ($30\text{ BDT}$) | $3{,}000\text{ paisa}$ ($30\text{ BDT}$) |
+| **Distance Charge** | $10.0 \times 2{,}500 = 25{,}000\text{ paisa}$ | $8.5 \times 2{,}500 = 21{,}250\text{ paisa}$ |
+| **Gross Solo Fare** | $3{,}000 + 25{,}000 = 28{,}000\text{ paisa}$ ($280\text{ BDT}$) | $3{,}000 + 21{,}250 = 24{,}250\text{ paisa}$ ($242.50\text{ BDT}$) |
+| **Pool Discount ($20\%$)** | $28{,}000 \times 0.20 = \mathbf{5{,}600\text{ paisa}}$ ($56\text{ BDT}$) | $24{,}250 \times 0.20 = \mathbf{4{,}850\text{ paisa}}$ ($48.50\text{ BDT}$) |
+| **Final Passenger Fare** | $28{,}000 - 5{,}600 = \mathbf{22{,}400\text{ paisa}}$ ($\mathbf{224.00\text{ BDT}}$) | $24{,}250 - 4{,}850 = \mathbf{19{,}400\text{ paisa}}$ ($\mathbf{194.00\text{ BDT}}$) |
+
+**Pool Economics Summary:**
+- Combined Passenger Collections: $22{,}400 + 19{,}400 = 41{,}800\text{ paisa}$ ($418.00\text{ BDT}$).
+- Revenue vs Single Solo Rider: $+49.3\%$ gross fare yield for driver/fleet.
+- Rider Savings: Both Nusrat and Rafiq save exactly $20\%$ compared to private non-pooled rides.
 
 ---
 

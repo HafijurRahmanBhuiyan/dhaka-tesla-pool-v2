@@ -5,6 +5,9 @@ import { RelationshipsView } from './components/RelationshipsView';
 import { SqlSchemaView } from './components/SqlSchemaView';
 import { DockerComposeView } from './components/DockerComposeView';
 import { SimulatorView } from './components/SimulatorView';
+import { ApiAuthView } from './components/ApiAuthView';
+import { PassengerFlowView } from './components/PassengerFlowView';
+import { DriverDashboardView } from './components/DriverDashboardView';
 import {
   Layers,
   Database,
@@ -14,20 +17,26 @@ import {
   PlayCircle,
   Car,
   Shield,
-  Zap
+  Zap,
+  KeyRound,
+  Navigation,
+  Radio
 } from 'lucide-react';
 
 export function App() {
   const [activeTab, setActiveTab] = useState<
-    'arch' | 'erd' | 'relationships' | 'sql' | 'docker' | 'simulator'
-  >('arch');
+    'passenger' | 'driver' | 'api-auth' | 'arch' | 'erd' | 'relationships' | 'sql' | 'docker' | 'simulator'
+  >('driver');
 
   const navItems = [
+    { id: 'driver', label: "Driver Dashboard (Jashim)", icon: Radio, badge: 'Bullet' },
+    { id: 'passenger', label: 'Passenger Flow', icon: Navigation, badge: 'Live Polling' },
+    { id: 'api-auth', label: 'Express Auth & Routes', icon: KeyRound, badge: 'Live API' },
     { id: 'arch', label: 'Component Architecture', icon: Layers, badge: 'Mermaid' },
     { id: 'erd', label: 'ERD & Tables', icon: Database, badge: '9 Tables' },
     { id: 'relationships', label: 'Relationships', icon: Network, badge: '1-2 Lines' },
     { id: 'sql', label: 'PostgreSQL DDL', icon: FileCode, badge: 'Postgres 16' },
-    { id: 'docker', label: 'Docker Compose', icon: Box, badge: 'Compose v3.9' },
+    { id: 'docker', label: 'Docker Compose', icon: Box, badge: '3 Services' },
     { id: 'simulator', label: 'Live Pool Simulator', icon: PlayCircle, badge: 'Interactive' }
   ];
 
@@ -105,6 +114,9 @@ export function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {activeTab === 'driver' && <DriverDashboardView />}
+        {activeTab === 'passenger' && <PassengerFlowView />}
+        {activeTab === 'api-auth' && <ApiAuthView />}
         {activeTab === 'arch' && <ArchitectureView />}
         {activeTab === 'erd' && <ERDView />}
         {activeTab === 'relationships' && <RelationshipsView />}

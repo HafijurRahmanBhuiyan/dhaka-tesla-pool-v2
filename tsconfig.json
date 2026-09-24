@@ -16,5 +16,13 @@
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  "include": [
+    "src",
+    "server.ts",
+    "routes",
+    "controllers",
+    "services",
+    "middleware",
+    "models"
+  ]
 }

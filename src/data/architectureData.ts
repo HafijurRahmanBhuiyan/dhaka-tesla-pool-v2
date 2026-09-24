@@ -19,9 +19,9 @@ export const COMPONENT_MERMAID = `graph TB
         end
 
         subgraph CoreDomain["Core Ride-Pooling Domain Services"]
-            PoolMatcher["Pool Matching & Routing Engine<br/>• Corridor Overlap Filter (Dhaka routes)<br/>• Detour Constraint (detour <= 1.30x)<br/>• Seat Capacity Validator (<= 4 seats)"]
+            PoolMatcher["Pool Matching & Routing Engine<br/>• Corridor Overlap Filter (Dhaka routes)<br/>• Detour Constraint (detour &le; 1.30x)<br/>• Seat Capacity Validator (&le; 4 seats)"]
             FareEngine["Dynamic Pooling Fare Engine<br/>• Base Fare + Distance (BDT/km)<br/>• Occupancy Pooling Discount (20-40%)"]
-            Dispatcher["Driver Dispatcher & Trip State Machine<br/>• FORMING -> DISPATCHED -> IN_PROGRESS -> COMPLETED"]
+            Dispatcher["Driver Dispatcher & Trip State Machine<br/>• FORMING &rarr; DISPATCHED &rarr; IN_PROGRESS &rarr; COMPLETED"]
         end
 
         subgraph DataAccess["Persistence & Cache Abstraction"]
@@ -38,18 +38,23 @@ export const COMPONENT_MERMAID = `graph TB
         PostgresInstance[("PostgreSQL 16 + PostGIS<br/>• Spatial Indexing (GIST on lat/lng coordinates)<br/>• Strict B-Tree Indexes on Foreign Keys & Status<br/>• Check Constraints (Seat bounds 1-4, Ratings 1-5)<br/>• Immutable Audit Logging (ride_status_history)")]
     end
 
-    Clients -->|HTTPS REST API / WSS| NginxGateway
-    NginxGateway -->|Reverse Proxy HTTP :3000| HttpControllers
-    NginxGateway -->|WebSocket Upgrade :3000| SocketGateway
+    PassengerApp -->|HTTPS REST API / WSS| NginxGateway
+    DriverApp -->|HTTPS REST API / WSS| NginxGateway
+    AdminApp -->|HTTPS REST API| NginxGateway
+    NginxGateway -->|Reverse Proxy HTTP 3000| HttpControllers
+    NginxGateway -->|WebSocket Upgrade 3000| SocketGateway
     HttpControllers --> AuthMw
     AuthMw --> CoreDomain
-    SocketGateway <--> RedisClient
+    SocketGateway -->|PubSub Event Stream| RedisClient
+    RedisClient -->|Location Broadcast| SocketGateway
     PoolMatcher --> RedisClient
     PoolMatcher --> DBAccess
     Dispatcher --> DBAccess
     FareEngine --> DBAccess
-    RedisClient <--> RedisInstance
-    DBAccess <-->|Connection Pool (pg.Pool)| PostgresInstance
+    RedisClient --> RedisInstance
+    RedisInstance --> RedisClient
+    DBAccess -->|Connection Pool via pg.Pool| PostgresInstance
+    PostgresInstance -->|Query Result Set| DBAccess
 `;
 
 export const ERD_MERMAID = `erDiagram
